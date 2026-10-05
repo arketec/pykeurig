@@ -318,10 +318,10 @@ class KeurigApi:
     def _get_headers(self, extra_headers=None):
         """Gets the default set of headers to pass to requests."""
         headers = {
-            "User-Agent": HEADER_USER_AGENT,
+            #"User-Agent": HEADER_USER_AGENT,
             "Ocp-Apim-Subscription-Key": HEADER_OCP_SUBSCRIPTION_KEY,
             "Content-Type": "application/json",
-            "reqId": str(uuid.uuid4()),
+            #"reqId": str(uuid.uuid4()),
         }
         if self._access_token is not None:
             headers["Authorization"] = "Bearer " + self._access_token
