@@ -179,6 +179,7 @@ class KeurigApi:
             # We need to do this to get the URL
             await self._async_get_signalr_access_token()
         except Exception:
+            _LOGGER.exception("SignalR negotiate failed")
             return False
 
         hub_connection = (
@@ -187,11 +188,13 @@ class KeurigApi:
                 self._signalr_url,
                 options={"access_token_factory": self._get_signalr_access_token},
             )
+            .configure_logging(logging.DEBUG)
             .build()
         )
         hub_connection.on("appliance-notifications", self._receive_signalr)
         hub_connection.on_error(self._reconnect_websocket)
         hub_connection.on_close(self._reconnect_websocket)
+        hub_connection.on_open(lambda: _LOGGER.debug("SignalR connected"))
         result = hub_connection.start()
         self._signalr_connection = hub_connection
         if result:
@@ -213,6 +216,7 @@ class KeurigApi:
         try:
             self._get_signalr_access_token()
         except Exception:
+            _LOGGER.exception("SignalR negotiate failed")
             return False
 
         hub_connection = (
@@ -244,7 +248,7 @@ class KeurigApi:
                         self._signalr_connection.stop()
                     except Exception:
                         pass
-                print("RECONNECTING")
+                _LOGGER.debug("SignalR reconnecting, attempt: %d", self._reconnect_count)
                 self._reconnect_count += 1
                 reconnect_delay = 2**self._reconnect_count
                 if reconnect_delay > self.MAX_RECONNECT_DELAY:
@@ -302,7 +306,7 @@ class KeurigApi:
             device_id = msg["deviceId"]
             body = msg["body"]
 
-            print(msg)
+            _LOGGER.debug("SignalR msg: %s", msg)
 
             # It will be immediately followed by a BrewStateChange so no need to trigger two updates
             if msg["eventType"] == "ApplianceStateChange" and body["current"] == "BREW":
