@@ -1,5 +1,6 @@
 """Provides access to the Keurig SMART APIs."""
 # pylint: disable=protected-access, broad-except, too-many-lines
+import asyncio
 import json
 import logging
 import time
@@ -63,32 +64,78 @@ class KeurigApi:
         self._signalr_connection = None
         self._reconnect_count = 0
         self._disconnecting = False
+        self._email = None
+        self._password = None
+        self._refresh_lock = asyncio.Lock()
+        self._auth_failures = 0
+        self._auth_retry_at = 0.0
 
-    async def login(self, email: str, password: str):
-        """Logs you into the Keurig API"""
-        try:
-            data = {
+    async def async_login(self, email: str, password: str):
+        """Log in with a password grant.
+
+        Raises UnauthorizedException if Keurig rejects the credentials and
+        httpx errors for anything else (network, 5xx).
+        """
+        self._email = email
+        self._password = password
+        await self._async_token_request(
+            {
                 "grant_type": "password",
                 "client_id": CLIENT_ID,
                 "username": email,
                 "password": password,
             }
-            client = httpx.AsyncClient()
-            client.headers = self._get_headers({"Accept-Encoding": "identity"})
+        )
 
-            endpoint = f"{API_URL}api/claa/v1/oauth/token"
-            res = await client.post(endpoint, json=data, timeout=self._timeout)
-            res.raise_for_status()
+    async def async_ensure_token(self):
+        """Make sure a valid access token is held, refreshing or logging in if needed."""
+        if self._access_token is None or (
+            self._token_expires_at is not None and self._token_expires_at <= time.time()
+        ):
+            if not await self._async_refresh_token():
+                raise UnauthorizedException()
 
-            json_result = res.json()
-
-            self._access_token = json_result["access_token"]
-            self._token_expires_at = time.time() + json_result["expires_in"] - 120
-            self._refresh_token = json_result["refresh_token"]
-        except Exception as ex:
-            return False
+    async def _async_token_request(self, data: dict):
+        """POST to the OAuth token endpoint and store the resulting tokens."""
+        client = httpx.AsyncClient()
+        try:
+            # Never send the (possibly expired) bearer token to the token endpoint
+            client.headers = self._get_headers(
+                {"Accept-Encoding": "identity"}, auth=False
+            )
+            res = await client.post(
+                f"{API_URL}api/claa/v1/oauth/token", json=data, timeout=self._timeout
+            )
         finally:
             await client.aclose()
+
+        if res.status_code in (400, 401, 403):
+            _LOGGER.warning(
+                "Keurig %s grant rejected: %s %s",
+                data["grant_type"], res.status_code, res.text[:500],
+            )
+            raise UnauthorizedException()
+        if res.is_error:
+            _LOGGER.error(
+                "Keurig %s grant failed: %s %s",
+                data["grant_type"], res.status_code, res.text[:500],
+            )
+        res.raise_for_status()
+        self.__store_tokens(res.json())
+
+    def __store_tokens(self, json_result: dict):
+        self._access_token = json_result["access_token"]
+        self._token_expires_at = time.time() + json_result["expires_in"] - 120
+        # Some grants don't rotate the refresh token; keep the old one if absent
+        self._refresh_token = json_result.get("refresh_token", self._refresh_token)
+
+    async def login(self, email: str, password: str):
+        """Logs you into the Keurig API. Returns False on any failure."""
+        try:
+            await self.async_login(email, password)
+        except Exception as ex:
+            _LOGGER.error("Keurig login failed: %s", ex)
+            return False
         return True
 
     async def async_get_customer(self):
@@ -319,7 +366,7 @@ class KeurigApi:
             if device is not None:
                 device._update_properties()
 
-    def _get_headers(self, extra_headers=None):
+    def _get_headers(self, extra_headers=None, auth: bool = True):
         """Gets the default set of headers to pass to requests."""
         headers = {
             #"User-Agent": HEADER_USER_AGENT,
@@ -327,7 +374,7 @@ class KeurigApi:
             "Content-Type": "application/json",
             #"reqId": str(uuid.uuid4()),
         }
-        if self._access_token is not None:
+        if auth and self._access_token is not None:
             headers["Authorization"] = "Bearer " + self._access_token
 
         if extra_headers is not None:
@@ -535,35 +582,52 @@ class KeurigApi:
         return res
 
     async def _async_refresh_token(self):
-        """Retrieve a new access token asynchronously using a refresh_token"""
+        """Get a new access token: refresh grant first, then full login.
 
-        data = {
-            "grant_type": "refresh_token",
-            "client_id": CLIENT_ID,
-            "refresh_token": self._refresh_token,
-        }
+        Returns False only when Keurig rejects the stored credentials.
+        Raises on network/server errors, and backs off after repeated failures
+        so a Keurig outage doesn't turn into hundreds of login attempts.
+        """
+        stale_token = self._access_token
+        async with self._refresh_lock:
+            if self._access_token is not None and self._access_token != stale_token:
+                return True  # another caller refreshed while we waited
 
-        client = httpx.AsyncClient()
-        try:
-            client.headers = self._get_headers({"Accept-Encoding": "identity"})
+            if time.time() < self._auth_retry_at:
+                raise ConnectionError(
+                    f"Keurig auth backing off for {int(self._auth_retry_at - time.time())}s"
+                )
 
-            endpoint = f"{API_URL}api/claa/v1/oauth/token"
-            res = await client.post(endpoint, json=data, timeout=self._timeout)
-            if res.status_code in (400, 401, 403):
+            if self._refresh_token is not None:
+                try:
+                    await self._async_token_request(
+                        {
+                            "grant_type": "refresh_token",
+                            "client_id": CLIENT_ID,
+                            "refresh_token": self._refresh_token,
+                        }
+                    )
+                    self._auth_failures = 0
+                    return True
+                except Exception as err:
+                    _LOGGER.warning("Token refresh failed (%s); trying full login", err)
+                    self._refresh_token = None
+
+            if self._email is None or self._password is None:
                 return False
-            res.raise_for_status()
 
-            json_result = res.json()
-            self._access_token = json_result["access_token"]
-            self._token_expires_at = time.time() + json_result["expires_in"] - 120
-            self._refresh_token = json_result["refresh_token"]
-        except Exception as err:
-            _LOGGER.error("Error refreshing access token: %s", err)
-            raise err
-        finally:
-            await client.aclose()
-
-        return True
+            try:
+                await self.async_login(self._email, self._password)
+            except UnauthorizedException:
+                return False
+            except Exception:
+                self._auth_failures += 1
+                delay = min(60 * 2 ** (self._auth_failures - 1), 3600)
+                self._auth_retry_at = time.time() + delay
+                _LOGGER.error("Keurig login failed; next attempt in %ss", delay)
+                raise
+            self._auth_failures = 0
+            return True
 
     def _get_refresh_token(self):
         """Retrieve a new access token synchronously using a refresh_token"""
@@ -576,7 +640,9 @@ class KeurigApi:
 
         client = httpx.Client()
         try:
-            client.headers = self._get_headers({"Accept-Encoding": "identity"})
+            client.headers = self._get_headers(
+                {"Accept-Encoding": "identity"}, auth=False
+            )
 
             endpoint = f"{API_URL}api/claa/v1/oauth/token"
             res = client.post(endpoint, json=data, timeout=self._timeout)
