@@ -14,8 +14,10 @@ CLIENT_ID = "cbma-v1"  # legacy password-grant client, now blocked by Cloudflare
 # Client ID and redirect URI are the ones keurig.com's own sign-in page uses;
 # redirect URI must match that client's registered value exactly.
 AUTH0_URL = "https://login.keurig.com/"
-AUTH0_CLIENT_ID = "kqRwx9GzIfhobyPbap2DvfSaWWGSNayu"
-AUTH0_REDIRECT_URI = "https://www.keurig.com/authCallBack"
+#AUTH0_CLIENT_ID = "kqRwx9GzIfhobyPbap2DvfSaWWGSNayu" # webapp
+AUTH0_CLIENT_ID = "YGF1aAg0LRo5z4liWWz9xK1GLbS2vJET" # mobile app
+#AUTH0_REDIRECT_URI = "https://www.keurig.com/authCallBack"
+AUTH0_REDIRECT_URI = "com.keurig.kconnect.auth0://login.keurig.com/ios/com.keurig.kconnect/callback" # mobile app redirect URI
 AUTH0_AUDIENCE = "customers-apis"
 AUTH0_SCOPE = "openid profile email offline_access"
 
